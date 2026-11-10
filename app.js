@@ -573,8 +573,129 @@ function parseExcel(arrayBuffer, type) {
 }
 
 /* =========================================================
- * 4. PDF (.pdf) 解析器：座標排序、字級標題辨識、重複頁首頁尾濾除與斷行段落合併
+ * 4. PDF (.pdf) 解析器：座標排序、字型與真實色彩吸取、重複頁首頁尾濾除與斷行段落合併
  * ========================================================= */
+function rgbToHex(r, g, b) {
+  const clamp = (n) => Math.max(0, Math.min(255, Math.round(n)));
+  return [clamp(r), clamp(g), clamp(b)]
+    .map((v) => v.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
+}
+
+function medianOfSorted(arr) {
+  if (!arr || arr.length === 0) return 0;
+  return arr[Math.floor(arr.length / 2)];
+}
+
+/**
+ * 解析 PDF 文字項目的字型家族 (Font Family)、粗體與斜體，對應為 PowerPoint 支援之字型
+ */
+function resolvePdfFontProps(item, styles, text) {
+  const rawName = String(item.fontName || "");
+  const styleObj = (styles && styles[rawName]) || {};
+  const rawFamily = String(styleObj.fontFamily || "");
+  const combined = `${rawName} ${rawFamily}`;
+  const tx = item.transform || [1, 0, 0, 1, 0, 0];
+
+  const isBold = /bold|black|heavy|semibold|demi|extrab|w[6-9]|medi/i.test(combined);
+  const isItalic = /italic|oblique/i.test(combined) || Math.abs(tx[2]) > 0.08;
+  const hasCjk = /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(text || "");
+
+  let fontFace = hasCjk ? "Microsoft JhengHei" : "Arial";
+  if (/kai|楷/i.test(combined)) {
+    fontFace = "DFKai-SB";
+  } else if (/ming|song|細明|明體|宋/i.test(combined)) {
+    fontFace = "PMingLiU";
+  } else if (/mono|courier|consolas|menlo|code/i.test(combined)) {
+    fontFace = "Consolas";
+  } else if (/serif|times|georgia|garamond|minion|cambria/i.test(combined) && !/sans/i.test(combined)) {
+    fontFace = hasCjk ? "PMingLiU" : "Times New Roman";
+  } else if (/calibri/i.test(combined)) {
+    fontFace = hasCjk ? "Microsoft JhengHei" : "Calibri";
+  }
+
+  return { fontFace, isBold, isItalic };
+}
+
+/**
+ * 從已渲染的 PDF Canvas 像素中精確吸取該文字區塊的「原始文字顏色 (colorHex)」與「局部背景色 (bgHex)」
+ */
+function sampleTextAndBgColorsFromCanvas(ctx, xPt, yTopPt, widthPt, heightPt, scale, canvasW, canvasH) {
+  const defaultResult = { colorHex: "0F172A", bgHex: "FFFFFF", bgRgb: [255, 255, 255] };
+  if (!ctx || typeof ctx.getImageData !== "function") return defaultResult;
+
+  try {
+    const pad = 2;
+    const x0 = Math.max(0, Math.floor(xPt * scale) - pad);
+    const y0 = Math.max(0, Math.floor(yTopPt * scale) - pad);
+    const x1 = Math.min(canvasW - 1, Math.ceil((xPt + widthPt) * scale) + pad);
+    const y1 = Math.min(canvasH - 1, Math.ceil((yTopPt + heightPt) * scale) + pad);
+    const w = x1 - x0 + 1;
+    const h = y1 - y0 + 1;
+    if (w <= 2 || h <= 2) return defaultResult;
+
+    const imgData = ctx.getImageData(x0, y0, w, h).data;
+
+    // 1. Sample perimeter pixels (top & bottom edges) to find local background color
+    const bgRs = [];
+    const bgGs = [];
+    const bgBs = [];
+    for (let cx = 0; cx < w; cx++) {
+      const topIdx = cx * 4;
+      const botIdx = ((h - 1) * w + cx) * 4;
+      bgRs.push(imgData[topIdx], imgData[botIdx]);
+      bgGs.push(imgData[topIdx + 1], imgData[botIdx + 1]);
+      bgBs.push(imgData[topIdx + 2], imgData[botIdx + 2]);
+    }
+    bgRs.sort((a, b) => a - b);
+    bgGs.sort((a, b) => a - b);
+    bgBs.sort((a, b) => a - b);
+    const bgR = medianOfSorted(bgRs);
+    const bgG = medianOfSorted(bgGs);
+    const bgB = medianOfSorted(bgBs);
+
+    // 2. Find interior pixels with highest contrast from background (the core strokes of the text)
+    const candidates = [];
+    for (let cy = 1; cy < h - 1; cy++) {
+      for (let cx = 1; cx < w - 1; cx++) {
+        const idx = (cy * w + cx) * 4;
+        const r = imgData[idx];
+        const g = imgData[idx + 1];
+        const b = imgData[idx + 2];
+        const dist = Math.hypot(r - bgR, g - bgG, b - bgB);
+        if (dist > 28) {
+          candidates.push({ r, g, b, dist });
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
+      return {
+        colorHex: bgR + bgG + bgB < 380 ? "FFFFFF" : "0F172A",
+        bgHex: rgbToHex(bgR, bgG, bgB),
+        bgRgb: [bgR, bgG, bgB],
+      };
+    }
+
+    // Sort by contrast distance descending and take top 25% core stroke pixels (avoiding anti-aliased edges)
+    candidates.sort((a, b) => b.dist - a.dist);
+    const topCount = Math.max(1, Math.ceil(candidates.length * 0.25));
+    const core = candidates.slice(0, topCount);
+    const fgRs = core.map((c) => c.r).sort((a, b) => a - b);
+    const fgGs = core.map((c) => c.g).sort((a, b) => a - b);
+    const fgBs = core.map((c) => c.b).sort((a, b) => a - b);
+
+    return {
+      colorHex: rgbToHex(medianOfSorted(fgRs), medianOfSorted(fgGs), medianOfSorted(fgBs)),
+      bgHex: rgbToHex(bgR, bgG, bgB),
+      bgRgb: [bgR, bgG, bgB],
+    };
+  } catch (_) {
+    return defaultResult;
+  }
+}
+
 async function parsePdf(arrayBuffer) {
   if (!window.pdfjsLib) {
     throw new Error("PDF.js 尚未載入，請確認網路連線或重新整理頁面");
@@ -584,7 +705,7 @@ async function parsePdf(arrayBuffer) {
   const loadingTask = window.pdfjsLib.getDocument({
     data: new Uint8Array(pdfBytes),
     useSystemFonts: true,
-    disableFontFace: true,
+    disableFontFace: false,
   });
   const pdfDoc = await loadingTask.promise;
 
@@ -597,20 +718,27 @@ async function parsePdf(arrayBuffer) {
     const pageWidthPt = viewport.width || 612;
     const pageHeightPt = viewport.height || 792;
     const textContent = await page.getTextContent();
+    const styles = textContent.styles || {};
 
-    // Render thumbnail preview for PDF-to-PPT tab if canvas is supported
+    // Render page at 1.2x scale for thumbnail preview AND pixel-accurate text color sampling
     let thumbDataUrl = "";
+    let sampleCtx = null;
+    let sampleW = 0;
+    let sampleH = 0;
+    const sampleScale = 1.25;
     try {
       const thumbCanvas = document.createElement("canvas");
       if (thumbCanvas && typeof thumbCanvas.getContext === "function") {
-        const thumbViewport = page.getViewport({ scale: 0.8 });
-        thumbCanvas.width = Math.ceil(thumbViewport.width);
-        thumbCanvas.height = Math.ceil(thumbViewport.height);
-        const ctx = thumbCanvas.getContext("2d");
-        if (ctx) {
-          ctx.fillStyle = "#ffffff";
-          ctx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
-          await page.render({ canvasContext: ctx, viewport: thumbViewport }).promise;
+        const thumbViewport = page.getViewport({ scale: sampleScale });
+        sampleW = Math.ceil(thumbViewport.width);
+        sampleH = Math.ceil(thumbViewport.height);
+        thumbCanvas.width = sampleW;
+        thumbCanvas.height = sampleH;
+        sampleCtx = thumbCanvas.getContext("2d");
+        if (sampleCtx) {
+          sampleCtx.fillStyle = "#ffffff";
+          sampleCtx.fillRect(0, 0, sampleW, sampleH);
+          await page.render({ canvasContext: sampleCtx, viewport: thumbViewport }).promise;
           thumbDataUrl = thumbCanvas.toDataURL("image/png");
         }
       }
@@ -618,7 +746,7 @@ async function parsePdf(arrayBuffer) {
       // Ignore thumbnail rendering errors in headless environments
     }
 
-    // Extract text items with coordinates and font size
+    // Extract text items with coordinates, font family, bold, italic, and font size
     const items = [];
     for (const item of textContent.items) {
       if (!item.str || !item.str.trim()) continue;
@@ -627,6 +755,8 @@ async function parsePdf(arrayBuffer) {
       const y = tx[5];
       const fontSize = Math.round(Math.hypot(tx[0], tx[1]) || item.height || 12);
       const itemWidth = item.width || item.str.length * fontSize * 0.52;
+      const fontProps = resolvePdfFontProps(item, styles, item.str);
+
       allFontSizes.push(fontSize);
       items.push({
         str: item.str,
@@ -634,23 +764,26 @@ async function parsePdf(arrayBuffer) {
         y,
         width: itemWidth,
         fontSize,
+        fontFace: fontProps.fontFace,
+        isBold: fontProps.isBold,
+        isItalic: fontProps.isItalic,
       });
     }
 
     // Sort top-to-bottom (descending Y in PDF coordinate space), then left-to-right (ascending X)
     items.sort((a, b) => {
-      const tol = Math.max(4, Math.min(a.fontSize, b.fontSize) * 0.45);
+      const tol = Math.max(3.5, Math.min(a.fontSize, b.fontSize) * 0.42);
       if (Math.abs(b.y - a.y) > tol) return b.y - a.y;
       return a.x - b.x;
     });
 
-    // Group items into visual lines
+    // Group items into visual lines (for AI text extraction) AND tight horizontal segments (for PPT editable text boxes)
     const lineGroups = [];
     for (const item of items) {
       const lastGroup = lineGroups[lineGroups.length - 1];
       if (
         lastGroup &&
-        Math.abs(lastGroup.y - item.y) <= Math.max(4, Math.min(lastGroup.fontSize, item.fontSize) * 0.45)
+        Math.abs(lastGroup.y - item.y) <= Math.max(3.5, Math.min(lastGroup.fontSize, item.fontSize) * 0.42)
       ) {
         lastGroup.items.push(item);
         lastGroup.fontSize = Math.max(lastGroup.fontSize, item.fontSize);
@@ -663,53 +796,149 @@ async function parsePdf(arrayBuffer) {
       }
     }
 
-    // Join items within each line and calculate bounding box in top-left origin PDF points
-    const lines = lineGroups
-      .map((group) => {
-        group.items.sort((a, b) => a.x - b.x);
-        let lineText = "";
-        let prevEnd = null;
-        let prevChar = "";
-        const minX = group.items[0].x;
-        let maxEnd = minX;
+    const lines = [];
+    const pptSegments = [];
 
-        for (const it of group.items) {
-          const text = it.str;
-          if (prevEnd !== null) {
-            const gap = it.x - prevEnd;
-            const firstChar = text.charAt(0);
-            const isCjkPair =
-              /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(prevChar) &&
-              /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(firstChar);
+    for (const group of lineGroups) {
+      group.items.sort((a, b) => a.x - b.x);
+      let lineText = "";
+      let prevEnd = null;
+      let prevChar = "";
+      const minX = group.items[0].x;
+      let maxEnd = minX;
 
-            if (gap > group.fontSize * 2.2) {
-              lineText += "  ";
-            } else if (gap > group.fontSize * 0.25 && !isCjkPair && !lineText.endsWith(" ") && !text.startsWith(" ")) {
-              lineText += " ";
-            }
+      // Also split into tight PPT segments when there is a large horizontal gap (columns/tables) or font change
+      let curSeg = null;
+
+      for (const it of group.items) {
+        const text = it.str;
+        const itemEnd = it.x + (it.width || text.length * it.fontSize * 0.52);
+
+        if (prevEnd !== null) {
+          const gap = it.x - prevEnd;
+          const firstChar = text.charAt(0);
+          const isCjkPair =
+            /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(prevChar) &&
+            /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(firstChar);
+
+          if (gap > group.fontSize * 2.2) {
+            lineText += "  ";
+          } else if (gap > group.fontSize * 0.25 && !isCjkPair && !lineText.endsWith(" ") && !text.startsWith(" ")) {
+            lineText += " ";
           }
-          lineText += text;
-          prevEnd = it.x + (it.width || text.length * group.fontSize * 0.5);
-          if (prevEnd > maxEnd) maxEnd = prevEnd;
-          prevChar = text.charAt(text.length - 1);
+
+          // Check if item belongs to current PPT segment or starts a new column/segment
+          const sameStyle =
+            curSeg &&
+            Math.abs(curSeg.fontSize - it.fontSize) <= 1.5 &&
+            curSeg.isBold === it.isBold &&
+            curSeg.fontFace === it.fontFace;
+          if (curSeg && sameStyle && gap <= group.fontSize * 1.35) {
+            if (gap > group.fontSize * 0.25 && !isCjkPair && !curSeg.text.endsWith(" ") && !text.startsWith(" ")) {
+              curSeg.text += " ";
+            }
+            curSeg.text += text;
+            curSeg.maxX = Math.max(curSeg.maxX, itemEnd);
+          } else {
+            if (curSeg) pptSegments.push(curSeg);
+            curSeg = {
+              text,
+              fontSize: it.fontSize,
+              fontFace: it.fontFace,
+              isBold: it.isBold,
+              isItalic: it.isItalic,
+              y: it.y,
+              minX: it.x,
+              maxX: itemEnd,
+            };
+          }
+        } else {
+          curSeg = {
+            text,
+            fontSize: it.fontSize,
+            fontFace: it.fontFace,
+            isBold: it.isBold,
+            isItalic: it.isItalic,
+            y: it.y,
+            minX: it.x,
+            maxX: itemEnd,
+          };
         }
 
-        // Convert baseline PDF Y (bottom-up) to top-down Y coordinate
+        lineText += text;
+        prevEnd = itemEnd;
+        if (prevEnd > maxEnd) maxEnd = prevEnd;
+        prevChar = text.charAt(text.length - 1);
+      }
+      if (curSeg) pptSegments.push(curSeg);
+
+      const trimmedLine = lineText.trim();
+      if (trimmedLine) {
         const yTopPt = Math.max(0, pageHeightPt - group.y - group.fontSize * 0.88);
         const widthPt = Math.max(group.fontSize, maxEnd - minX);
-        const heightPt = group.fontSize * 1.3;
+        const heightPt = group.fontSize * 1.25;
+        const sampled = sampleTextAndBgColorsFromCanvas(
+          sampleCtx,
+          Math.max(0, minX),
+          yTopPt,
+          widthPt,
+          heightPt,
+          sampleScale,
+          sampleW,
+          sampleH
+        );
 
-        return {
-          text: lineText.trim(),
+        lines.push({
+          text: trimmedLine,
           fontSize: group.fontSize,
+          fontFace: group.items[0].fontFace,
+          isBold: group.items[0].isBold,
+          isItalic: group.items[0].isItalic,
+          colorHex: sampled.colorHex,
+          bgHex: sampled.bgHex,
           y: group.y,
           xPt: Math.max(0, minX),
           yTopPt,
           widthPt,
           heightPt,
+        });
+      }
+    }
+
+    // Finalize tight PPT segments with exact bounding boxes and sampled colors
+    const finalizedSegments = pptSegments
+      .map((seg) => {
+        const text = seg.text.trim();
+        if (!text) return null;
+        const xPt = Math.max(0, seg.minX);
+        const yTopPt = Math.max(0, pageHeightPt - seg.y - seg.fontSize * 0.88);
+        const widthPt = Math.max(seg.fontSize * 0.8, seg.maxX - seg.minX);
+        const heightPt = seg.fontSize * 1.22;
+        const sampled = sampleTextAndBgColorsFromCanvas(
+          sampleCtx,
+          xPt,
+          yTopPt,
+          widthPt,
+          heightPt,
+          sampleScale,
+          sampleW,
+          sampleH
+        );
+        return {
+          text,
+          fontSize: seg.fontSize,
+          fontFace: seg.fontFace,
+          isBold: seg.isBold,
+          isItalic: seg.isItalic,
+          colorHex: sampled.colorHex,
+          bgHex: sampled.bgHex,
+          xPt,
+          yTopPt,
+          widthPt,
+          heightPt,
         };
       })
-      .filter((l) => l.text.length > 0);
+      .filter(Boolean);
 
     rawPages.push({
       pageNumber: pageNum,
@@ -717,6 +946,7 @@ async function parsePdf(arrayBuffer) {
       pageHeightPt,
       thumbDataUrl,
       lines,
+      pptSegments: finalizedSegments,
     });
   }
 
@@ -761,12 +991,19 @@ async function parsePdf(arrayBuffer) {
         isHeading: line.fontSize >= bodyFontSize * 1.25 && line.text.length <= 80,
       };
     });
+
+    const markedSegments = (p.pptSegments || []).map((seg) => ({
+      ...seg,
+      isHeading: seg.isBold || (seg.fontSize >= bodyFontSize * 1.25 && seg.text.length <= 80),
+    }));
+
     return {
       pageNumber: p.pageNumber,
       pageWidthPt: p.pageWidthPt,
       pageHeightPt: p.pageHeightPt,
       thumbDataUrl: p.thumbDataUrl,
       lines: markedLines,
+      pptSegments: markedSegments,
     };
   });
 
@@ -1294,62 +1531,111 @@ function getActivePdfFile() {
 }
 
 /**
- * 將單頁 PDF 的視覺行重組為 PPT 可編輯文字方塊（含精確座標與字級）
+ * 將單頁 PDF 的文字區塊重組為 PPT 可編輯文字方塊（保留原始字型、顏色、粗斜體與精確座標）
  */
 function getPptTextBlocksForPage(page, bodyFontSize, mergeBlocks) {
-  if (!page || !page.lines || page.lines.length === 0) return [];
+  const sourceList =
+    page && page.pptSegments && page.pptSegments.length > 0
+      ? page.pptSegments
+      : (page && page.lines) || [];
+  if (sourceList.length === 0) return [];
+
+  const normalized = sourceList.map((item) => ({
+    text: item.text,
+    fontSize: item.fontSize || 12,
+    fontFace: item.fontFace || "Microsoft JhengHei",
+    isBold: Boolean(item.isBold || item.isHeading),
+    isItalic: Boolean(item.isItalic),
+    isHeading: Boolean(item.isHeading),
+    isHeaderFooterOrPageNum: Boolean(item.isHeaderFooterOrPageNum),
+    colorHex: item.colorHex || "0F172A",
+    bgHex: item.bgHex || "FFFFFF",
+    xPt: item.xPt ?? 40,
+    yTopPt: item.yTopPt ?? 40,
+    widthPt: item.widthPt ?? 200,
+    heightPt: item.heightPt ?? (item.fontSize || 12) * 1.25,
+  }));
 
   if (!mergeBlocks) {
-    return page.lines.map((line) => ({
-      text: line.text,
-      fontSize: line.fontSize,
-      isHeading: Boolean(line.isHeading),
-      xPt: line.xPt ?? 40,
-      yTopPt: line.yTopPt ?? 40,
-      widthPt: line.widthPt ?? 400,
-      heightPt: line.heightPt ?? line.fontSize * 1.35,
-    }));
+    return normalized;
   }
 
-  // Merge adjacent lines that belong to the same visual paragraph / list block
+  // Merge vertically adjacent lines ONLY when they share the same font, size, color, and left alignment
   const blocks = [];
-  for (const line of page.lines) {
+  for (const item of normalized) {
     const prev = blocks[blocks.length - 1];
-    const lineX = line.xPt ?? 40;
-    const lineY = line.yTopPt ?? 40;
-    const lineW = line.widthPt ?? 400;
-    const lineH = line.heightPt ?? line.fontSize * 1.35;
-
     if (prev) {
       const prevBottom = prev.yTopPt + prev.heightPt;
-      const verticalGap = lineY - prevBottom;
-      const sameFontTier = Math.abs(prev.fontSize - line.fontSize) <= 2 && prev.isHeading === Boolean(line.isHeading);
-      const alignedLeft = Math.abs(prev.xPt - lineX) <= prev.fontSize * 2.5;
-      const isNewHeadingOrFooter = line.isHeading || line.isHeaderFooterOrPageNum || prev.isHeaderFooterOrPageNum;
+      const verticalGap = item.yTopPt - prevBottom;
+      const sameStyle =
+        Math.abs(prev.fontSize - item.fontSize) <= 1.5 &&
+        prev.fontFace === item.fontFace &&
+        prev.isBold === item.isBold &&
+        prev.colorHex === item.colorHex;
+      const alignedLeft = Math.abs(prev.xPt - item.xPt) <= prev.fontSize * 1.5;
 
-      if (!isNewHeadingOrFooter && sameFontTier && alignedLeft && verticalGap >= -4 && verticalGap <= prev.fontSize * 1.1) {
-        prev.text += "\n" + line.text;
-        const rightEdge = Math.max(prev.xPt + prev.widthPt, lineX + lineW);
-        prev.xPt = Math.min(prev.xPt, lineX);
+      if (sameStyle && alignedLeft && verticalGap >= -3 && verticalGap <= prev.fontSize * 0.95) {
+        prev.text += "\n" + item.text;
+        const rightEdge = Math.max(prev.xPt + prev.widthPt, item.xPt + item.widthPt);
+        prev.xPt = Math.min(prev.xPt, item.xPt);
         prev.widthPt = rightEdge - prev.xPt;
-        prev.heightPt = Math.max(prev.heightPt + lineH, lineY + lineH - prev.yTopPt);
+        prev.heightPt = Math.max(prev.heightPt + item.heightPt, item.yTopPt + item.heightPt - prev.yTopPt);
         continue;
       }
     }
-
-    blocks.push({
-      text: line.text,
-      fontSize: line.fontSize,
-      isHeading: Boolean(line.isHeading),
-      isHeaderFooterOrPageNum: Boolean(line.isHeaderFooterOrPageNum),
-      xPt: lineX,
-      yTopPt: lineY,
-      widthPt: lineW,
-      heightPt: lineH,
-    });
+    blocks.push({ ...item });
   }
 
   return blocks;
+}
+
+/**
+ * 智慧抹除底圖上的原始文字像素（以文字上下邊緣的真實背景色進行垂直插值修補，100% 保留圖案與漸層原色、絕不變淡）
+ */
+function eraseTextRegionsOnCanvas(ctx, segments, scale, canvasW, canvasH) {
+  if (!ctx || typeof ctx.getImageData !== "function" || !segments || segments.length === 0) return;
+
+  for (const seg of segments) {
+    try {
+      const padX = Math.max(2, Math.round(seg.fontSize * scale * 0.12));
+      const padY = Math.max(2, Math.round(seg.fontSize * scale * 0.15));
+      const x0 = Math.max(0, Math.floor(seg.xPt * scale) - padX);
+      const y0 = Math.max(0, Math.floor(seg.yTopPt * scale) - padY);
+      const x1 = Math.min(canvasW - 1, Math.ceil((seg.xPt + seg.widthPt) * scale) + padX);
+      const y1 = Math.min(canvasH - 1, Math.ceil((seg.yTopPt + seg.heightPt) * scale) + padY);
+      const w = x1 - x0 + 1;
+      const h = y1 - y0 + 1;
+      if (w <= 2 || h <= 2) continue;
+
+      const img = ctx.getImageData(x0, y0, w, h);
+      const data = img.data;
+
+      // For each vertical column x, linearly interpolate between top boundary pixel and bottom boundary pixel
+      for (let cx = 0; cx < w; cx++) {
+        const topIdx = cx * 4;
+        const botIdx = ((h - 1) * w + cx) * 4;
+        const rTop = data[topIdx];
+        const gTop = data[topIdx + 1];
+        const bTop = data[topIdx + 2];
+        const rBot = data[botIdx];
+        const gBot = data[botIdx + 1];
+        const bBot = data[botIdx + 2];
+
+        for (let cy = 1; cy < h - 1; cy++) {
+          const t = cy / (h - 1);
+          const idx = (cy * w + cx) * 4;
+          data[idx] = Math.round(rTop + (rBot - rTop) * t);
+          data[idx + 1] = Math.round(gTop + (gBot - gTop) * t);
+          data[idx + 2] = Math.round(bTop + (bBot - bTop) * t);
+          data[idx + 3] = 255;
+        }
+      }
+
+      ctx.putImageData(img, x0, y0);
+    } catch (_) {
+      // Ignore individual region errors
+    }
+  }
 }
 
 function renderPdf2PptPanel() {
@@ -1361,13 +1647,13 @@ function renderPdf2PptPanel() {
 
   // Update Mode Metric Display
   if (pptSettings.mode === "hybrid") {
-    pptMetricMode.textContent = "雙重混合";
-    pptMetricHint.textContent = "底圖保真 + 上層可編輯文字框";
+    pptMetricMode.textContent = "原色圖案+文字框";
+    pptMetricHint.textContent = "維持 100% 圖案原色 + 原色可編輯文字框";
   } else if (pptSettings.mode === "editable") {
-    pptMetricMode.textContent = "純文字可編輯";
-    pptMetricHint.textContent = "依座標重組可修改的 PPT 文字框";
+    pptMetricMode.textContent = "純文字方塊";
+    pptMetricHint.textContent = "依原座標、字型與顏色建立文字框";
   } else {
-    pptMetricMode.textContent = "100% 不跑版";
+    pptMetricMode.textContent = "純圖片不跑版";
     pptMetricHint.textContent = "高畫質頁面背景 + 備忘稿全文";
   }
 
@@ -1457,10 +1743,12 @@ function renderPdf2PptPanel() {
                   .replace(/</g, "&lt;")
                   .replace(/>/g, "&gt;")
                   .replace(/\n/g, " ↵ ");
-                const tag = b.isHeading ? `標題 ${b.fontSize}pt` : `${b.fontSize}pt`;
+                const weightLabel = b.isBold ? "粗體 " : "";
                 return `
                   <div class="slide-text-box-item">
-                    <span class="slide-text-box-meta">[${tag}]</span>
+                    <span class="slide-text-box-meta" title="字型：${b.fontFace} / 顏色：#${b.colorHex}">
+                      <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#${b.colorHex};border:1px solid rgba(255,255,255,0.4);vertical-align:middle;margin-right:3px;"></span>[${b.fontFace} ${weightLabel}${b.fontSize}pt]
+                    </span>
                     <span>${escaped}</span>
                   </div>
                 `;
@@ -1471,7 +1759,7 @@ function renderPdf2PptPanel() {
       const modeBadgeText =
         pptSettings.mode === "image"
           ? `高畫質背景圖 + 備忘稿文字`
-          : `可編輯文字方塊 x ${blocks.length}`;
+          : `原色可編輯文字方塊 x ${blocks.length}`;
 
       return `
         <div class="slide-card">
@@ -1505,7 +1793,7 @@ function renderPdf2PptPanel() {
 }
 
 /**
- * 將指定 PDF 檔案依高解析度渲染並轉換為可編輯 .pptx 簡報下載（保留原檔案名稱）
+ * 將指定 PDF 檔案依高解析度渲染並轉換為可編輯 .pptx 簡報下載（維持圖案原色、還原文字顏色與字型）
  */
 async function exportPdfToPptx(pdfFileObj) {
   if (!pdfFileObj || !pdfFileObj.parsedData) return;
@@ -1543,13 +1831,13 @@ async function exportPdfToPptx(pdfFileObj) {
       slideH = Number(Math.max(4, Math.min(14, 10 * ratio)).toFixed(3));
     }
 
-    // Render high-res page images if mode is "image" or "hybrid"
+    // Render high-res page images (and cleanly inpaint/erase old raster text in hybrid mode without dimming graphics!)
     const pageImages = [];
     if ((pptSettings.mode === "image" || pptSettings.mode === "hybrid") && pdfBytes && window.pdfjsLib) {
       const loadingTask = window.pdfjsLib.getDocument({
         data: new Uint8Array(pdfBytes),
         useSystemFonts: true,
-        disableFontFace: true,
+        disableFontFace: false,
       });
       const pdfDoc = await loadingTask.promise;
 
@@ -1564,6 +1852,14 @@ async function exportPdfToPptx(pdfFileObj) {
           ctx.fillStyle = "#ffffff";
           ctx.fillRect(0, 0, canvas.width, canvas.height);
           await page.render({ canvasContext: ctx, viewport: vp }).promise;
+
+          // If in hybrid mode and optPptHideBgText ("智慧抹除底圖原文字") is checked:
+          // Erase ONLY the text glyph regions by vertical edge interpolation so 100% of graphics stay vivid!
+          if (pptSettings.mode === "hybrid" && pptSettings.hideBgText) {
+            const segs = pages[i - 1]?.pptSegments || pages[i - 1]?.lines || [];
+            eraseTextRegionsOnCanvas(ctx, segs, pptSettings.scale, canvas.width, canvas.height);
+          }
+
           pageImages.push(canvas.toDataURL("image/png"));
         } else {
           pageImages.push(pages[i - 1]?.thumbDataUrl || "");
@@ -1585,7 +1881,7 @@ async function exportPdfToPptx(pdfFileObj) {
         const blocks = getPptTextBlocksForPage(page, bodyFontSize || 12, pptSettings.mergeBlocks);
         const imgData = pageImages[idx] || page.thumbDataUrl || "";
 
-        // 1. Add Background / Raster Layer for "image" or "hybrid" mode
+        // 1. Add 100% Original Vivid Background Layer for "image" or "hybrid" mode (NO dimming overlay!)
         if ((pptSettings.mode === "image" || pptSettings.mode === "hybrid") && imgData) {
           slide.addImage({
             data: imgData,
@@ -1594,49 +1890,37 @@ async function exportPdfToPptx(pdfFileObj) {
             w: slideW,
             h: slideH,
           });
-          if (pptSettings.mode === "hybrid" && pptSettings.hideBgText) {
-            // Add subtle translucent overlay so editable text boxes pop cleanly while preserving visuals
-            slide.addShape(pptx.ShapeType ? pptx.ShapeType.rect : "rect", {
-              x: 0,
-              y: 0,
-              w: slideW,
-              h: slideH,
-              fill: { color: "FFFFFF", transparency: 25 },
-              line: { color: "FFFFFF", width: 0 },
-            });
-          }
         }
 
-        // 2. Add Editable Text Boxes for "editable" or "hybrid" mode
+        // 2. Add Editable Text Boxes with exact original color, font family, bold/italic, and 0 margin
         if (pptSettings.mode === "editable" || pptSettings.mode === "hybrid") {
-          const scaleFactor = slideW / (pW / 72);
+          const ptScale = (slideW * 72) / pW;
           for (const b of blocks) {
-            const xIn = Number(Math.max(0.1, Math.min(slideW - 0.5, (b.xPt / pW) * slideW)).toFixed(3));
-            const yIn = Number(Math.max(0.08, Math.min(slideH - 0.3, (b.yTopPt / pH) * slideH)).toFixed(3));
+            const xIn = Number(Math.max(0, Math.min(slideW - 0.3, (b.xPt / pW) * slideW)).toFixed(3));
+            const yIn = Number(Math.max(0, Math.min(slideH - 0.2, (b.yTopPt / pH) * slideH)).toFixed(3));
+            // Give a slight width buffer so single-line text boxes don't prematurely wrap in PowerPoint
             const wIn = Number(
-              Math.max(1.0, Math.min(slideW - xIn - 0.08, (b.widthPt / pW) * slideW + 0.35)).toFixed(3)
+              Math.max(0.5, Math.min(slideW - xIn, ((b.widthPt + b.fontSize * 1.1) / pW) * slideW)).toFixed(3)
             );
-            const hIn = Number(Math.max(0.32, Math.min(slideH - yIn, (b.heightPt / pH) * slideH + 0.12)).toFixed(3));
-            const scaledFontPt = Math.max(8, Math.min(44, Math.round(b.fontSize * scaleFactor * 0.72)));
+            const hIn = Number(
+              Math.max(0.24, Math.min(slideH - yIn, ((b.heightPt + b.fontSize * 0.35) / pH) * slideH)).toFixed(3)
+            );
+            const scaledFontPt = Math.max(7, Math.min(64, Math.round(b.fontSize * ptScale * 0.94)));
 
-            const textOpts = {
+            slide.addText(b.text, {
               x: xIn,
               y: yIn,
               w: wIn,
               h: hIn,
+              fontFace: b.fontFace || "Microsoft JhengHei",
               fontSize: scaledFontPt,
-              bold: Boolean(b.isHeading),
-              color: b.isHeading ? "0F172A" : "1E293B",
+              bold: Boolean(b.isBold),
+              italic: Boolean(b.isItalic),
+              color: b.colorHex || "0F172A",
               valign: "top",
-              margin: 2,
-              breakLine: true,
-            };
-
-            if (pptSettings.mode === "hybrid" && pptSettings.hideBgText) {
-              textOpts.fill = { color: "FFFFFF", transparency: 5 };
-            }
-
-            slide.addText(b.text, textOpts);
+              margin: 0,
+              wrap: true,
+            });
           }
         }
 
@@ -1674,7 +1958,7 @@ async function exportPdfToPptx(pdfFileObj) {
 }
 
 /**
- * 原生 JSZip OpenXML (.pptx) 備援產生器（確保無外部 CDN 時依然能產生可編輯 .pptx）
+ * 原生 JSZip OpenXML (.pptx) 備援產生器（支援原始字型、文字顏色與無邊距文字方塊）
  */
 async function buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pptSettings, pageImages) {
   const zip = new JSZip();
@@ -1748,6 +2032,7 @@ async function buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pp
     const slideNum = idx + 1;
     const pW = page.pageWidthPt || 612;
     const pH = page.pageHeightPt || 792;
+    const ptScale = (slideW * 72) / pW;
     const blocks = getPptTextBlocksForPage(page, bodyFontSize || 12, pptSettings.mergeBlocks);
 
     let shapesXml = "";
@@ -1757,14 +2042,17 @@ async function buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pp
       blocks.forEach((b) => {
         const xEmu = Math.round((b.xPt / pW) * cx);
         const yEmu = Math.round((b.yTopPt / pH) * cy);
-        const wEmu = Math.round(Math.max(0.8 * emuPerInch, (b.widthPt / pW) * cx));
-        const hEmu = Math.round(Math.max(0.3 * emuPerInch, (b.heightPt / pH) * cy));
-        const fontHundredths = Math.max(800, Math.round(b.fontSize * 100));
+        const wEmu = Math.round(Math.max(0.5 * emuPerInch, ((b.widthPt + b.fontSize * 1.1) / pW) * cx));
+        const hEmu = Math.round(Math.max(0.24 * emuPerInch, ((b.heightPt + b.fontSize * 0.35) / pH) * cy));
+        const fontHundredths = Math.max(700, Math.round(b.fontSize * ptScale * 0.94 * 100));
+        const colorHex = b.colorHex || "0F172A";
+        const fontFace = escapeXml(b.fontFace || "Microsoft JhengHei");
+
         const parasXml = b.text
           .split("\n")
           .map(
             (line) =>
-              `<a:p><a:r><a:rPr lang="zh-TW" sz="${fontHundredths}" b="${b.isHeading ? 1 : 0}"/><a:t>${escapeXml(line)}</a:t></a:r></a:p>`
+              `<a:p><a:r><a:rPr lang="zh-TW" sz="${fontHundredths}" b="${b.isBold ? 1 : 0}" i="${b.isItalic ? 1 : 0}"><a:solidFill><a:srgbClr val="${colorHex}"/></a:solidFill><a:latin typeface="${fontFace}"/><a:ea typeface="${fontFace}"/></a:rPr><a:t>${escapeXml(line)}</a:t></a:r></a:p>`
           )
           .join("");
 
@@ -1778,9 +2066,10 @@ async function buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pp
             <p:spPr>
               <a:xfrm><a:off x="${xEmu}" y="${yEmu}"/><a:ext cx="${wEmu}" cy="${hEmu}"/></a:xfrm>
               <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+              <a:noFill/>
             </p:spPr>
             <p:txBody>
-              <a:bodyPr wrap="square" rtlCol="0"/>
+              <a:bodyPr wrap="square" lIns="0" tIns="0" rIns="0" bIns="0" rtlCol="0"/>
               <a:lstStyle/>
               ${parasXml}
             </p:txBody>
@@ -1887,23 +2176,24 @@ function showToast(message) {
  */
 function buildSamplePdfBytes() {
   const page1Stream = [
-    "BT",
-    "/F1 9 Tf 50 760 Td (ACME Enterprise Confidential Report - 2026) Tj ET",
-    "BT /F1 18 Tf 50 710 Td (Executive Summary: AI Document Pipeline) Tj ET",
-    "BT /F1 11 Tf 50 680 Td (Traditional PDF files contain repetitive running headers, page numbers,) Tj ET",
-    "BT /F1 11 Tf 50 664 Td (and hard line-breaks at the end of every visual margin that waste tokens.) Tj ET",
-    "BT /F1 11 Tf 50 636 Td (- Automated header and footer deduplication across all pages) Tj ET",
-    "BT /F1 11 Tf 50 620 Td (- Coordinate-based line reconstruction and smart paragraph merging) Tj ET",
-    "BT /F1 9 Tf 260 40 Td (Page 1 of 2) Tj ET",
+    "q 0.11 0.23 0.54 rg 40 695 532 42 re f Q",
+    "q 0.93 0.96 1.00 rg 40 595 532 70 re f Q",
+    "BT /F1 9 Tf 0.45 0.50 0.58 rg 50 760 Td (ACME Enterprise Confidential Report - 2026) Tj ET",
+    "BT /F1 18 Tf 1 1 1 rg 52 710 Td (Executive Summary: AI Document Pipeline) Tj ET",
+    "BT /F1 11 Tf 0.10 0.15 0.25 rg 50 672 Td (Traditional PDF files contain repetitive running headers, page numbers,) Tj ET",
+    "BT /F1 11 Tf 0.10 0.15 0.25 rg 50 656 Td (and hard line-breaks at the end of every visual margin that waste tokens.) Tj ET",
+    "BT /F1 12 Tf 0.08 0.38 0.75 rg 52 636 Td (- Automated header and footer deduplication across all pages) Tj ET",
+    "BT /F1 12 Tf 0.82 0.16 0.16 rg 52 614 Td (- Exact color, font family, and editable text-box reconstruction) Tj ET",
+    "BT /F1 9 Tf 0.45 0.50 0.58 rg 260 40 Td (Page 1 of 2) Tj ET",
   ].join("\n");
 
   const page2Stream = [
-    "BT",
-    "/F1 9 Tf 50 760 Td (ACME Enterprise Confidential Report - 2026) Tj ET",
-    "BT /F1 16 Tf 50 710 Td (Benchmark & Token Savings Analysis) Tj ET",
-    "BT /F1 11 Tf 50 680 Td (By merging broken lines and stripping repeated page metadata, LLM context) Tj ET",
-    "BT /F1 11 Tf 50 664 Td (comprehension improves while reducing prompt token consumption by 25-45%.) Tj ET",
-    "BT /F1 9 Tf 260 40 Td (Page 2 of 2) Tj ET",
+    "q 0.09 0.45 0.33 rg 40 695 532 42 re f Q",
+    "BT /F1 9 Tf 0.45 0.50 0.58 rg 50 760 Td (ACME Enterprise Confidential Report - 2026) Tj ET",
+    "BT /F1 16 Tf 1 1 1 rg 52 710 Td (Benchmark & Token Savings Analysis) Tj ET",
+    "BT /F1 11 Tf 0.10 0.15 0.25 rg 50 672 Td (By merging broken lines and stripping repeated page metadata, LLM context) Tj ET",
+    "BT /F1 11 Tf 0.10 0.15 0.25 rg 50 656 Td (comprehension improves while reducing prompt token consumption by 25-45%.) Tj ET",
+    "BT /F1 9 Tf 0.45 0.50 0.58 rg 260 40 Td (Page 2 of 2) Tj ET",
   ].join("\n");
 
   const objects = [
@@ -1911,7 +2201,7 @@ function buildSamplePdfBytes() {
     "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
     "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>\nendobj\n",
     "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>\nendobj\n",
-    "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n",
     `6 0 obj\n<< /Length ${page1Stream.length} >>\nstream\n${page1Stream}\nendstream\nendobj\n`,
     `7 0 obj\n<< /Length ${page2Stream.length} >>\nstream\n${page2Stream}\nendstream\nendobj\n`,
   ];

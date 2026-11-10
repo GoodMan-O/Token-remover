@@ -199,11 +199,11 @@
           </div>
           <div class="settings-body">
             <div class="form-group">
-              <label for="pptConvertMode">PPT 轉換模式（支援雙重混合選項）</label>
+              <label for="pptConvertMode">PPT 轉換模式</label>
               <select id="pptConvertMode">
-                <option value="hybrid" selected>🌟 雙重混合模式（推薦：底層保留原排版視覺 + 上層疊加可編輯文字框 + 備忘稿）</option>
-                <option value="editable">✏️ 文字可編輯模式（結構重組：依 PDF 座標與字級建立可修改的文字方塊）</option>
-                <option value="image">🖼️ 排版 100% 不跑版模式（高畫質頁面轉投影片 + 自動將文字填入備忘稿）</option>
+                <option value="hybrid" selected>🌟 原色圖案 + 可編輯文字方塊（推薦：維持原圖案鮮豔色彩、自動還原文字顏色與字型）</option>
+                <option value="editable">✏️ 純文字方塊模式（僅輸出原色可編輯文字方塊，不含背景圖案）</option>
+                <option value="image">🖼️ 純圖片不跑版模式（高畫質整頁圖片 + 自動將文字填入備忘稿）</option>
               </select>
             </div>
 
@@ -229,16 +229,16 @@
 
             <div class="checkbox-group">
               <label class="checkbox-label">
-                <input type="checkbox" id="optPptMergeBlocks" checked />
-                <span>智慧段落合併：將相鄰斷行合併為完整 PPT 文字方塊（更好編輯）</span>
+                <input type="checkbox" id="optPptHideBgText" checked />
+                <span>智慧抹除底圖原文字（維持圖案 100% 原始色彩不變淡，避免新舊文字重疊）</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optPptMergeBlocks" />
+                <span>合併同段落多行文字（預設關閉：逐行獨立定位可獲得最精準的字型與顏色對齊）</span>
               </label>
               <label class="checkbox-label">
                 <input type="checkbox" id="optPptIncludeNotes" checked />
                 <span>自動將每頁完整文字寫入 PPT 下方「演講者備忘稿」</span>
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" id="optPptHideBgText" checked />
-                <span>在「雙重混合模式」下自動淡化背景圖層（凸顯上層可編輯文字方塊）</span>
               </label>
             </div>
           </div>
