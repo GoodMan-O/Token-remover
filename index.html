@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Office2AI — 辦公文件轉 AI 低 Token 最佳化工具</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- JSZip for DOCX and PPTX parsing -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- SheetJS for Excel (.xlsx, .xls, .csv) parsing -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <!-- PDF.js for PDF parsing (works locally on file:// and http://) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">⚡</div>
+        <div>
+          <h1>Office2AI 轉換器</h1>
+          <p class="subtitle">自動辨識 PDF、Word、PPT、Excel，去蕪存菁轉換為 AI 易讀、極致省 Token 的結構化文本（100% 本地瀏覽器執行，不傳送至伺服器）</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btnDemo" class="btn btn-secondary" title="載入範例資料測試轉換效果">載入測試範例</button>
+        <button id="btnClearAll" class="btn btn-ghost" disabled>清空全部</button>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="main-grid">
+      <!-- Left Column: Dropzone, Settings, File Queue -->
+      <section class="left-panel">
+        <!-- Upload Dropzone -->
+        <div id="dropzone" class="dropzone" tabindex="0">
+          <input type="file" id="fileInput" multiple accept=".pdf,.docx,.pptx,.xlsx,.xls,.csv,.txt,.md,.json" hidden />
+          <div class="dropzone-content">
+            <div class="upload-icon">📄</div>
+            <h3>拖放檔案至此，或點擊選擇檔案</h3>
+            <p>系統會自動透過副檔名與檔案結構辨識格式</p>
+            <div class="format-badges">
+              <span class="badge badge-pdf">PDF (.pdf)</span>
+              <span class="badge badge-word">Word (.docx)</span>
+              <span class="badge badge-ppt">PPT (.pptx)</span>
+              <span class="badge badge-excel">Excel (.xlsx / .xls / .csv)</span>
+              <span class="badge badge-text">Text / JSON</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Token Optimization Options -->
+        <div class="card settings-card">
+          <div class="card-header">
+            <h2>🛠️ AI 讀取與 Token 節省設定</h2>
+          </div>
+          <div class="settings-body">
+            <div class="form-group">
+              <label for="outputFormat">AI 輸出結構格式</label>
+              <select id="outputFormat">
+                <option value="markdown" selected>精簡 Markdown（推薦：結構清晰、通用性最高）</option>
+                <option value="xml">XML 語意標籤封裝（適合 Claude / 多文檔 Context 區隔）</option>
+                <option value="json">緊湊 JSON 結構（適合程式化 API 串接）</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="tableFormat">表格壓縮策略（Excel 與文件內嵌表格）</label>
+              <select id="tableFormat">
+                <option value="csv" selected>緊湊 CSV 格式（極致省 Token：比標準 Markdown 表格省約 40% Token）</option>
+                <option value="tsv">緊湊 TSV 格式（Tab 分隔，適合含逗號之財務/文字報表）</option>
+                <option value="markdown">標準 Markdown 表格（視覺易讀，但分隔線較耗 Token）</option>
+              </select>
+            </div>
+
+            <div class="checkbox-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="optCollapseWhitespace" checked />
+                <span>壓縮多餘空白、重複換行與裝飾性符號</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optPdfSmartClean" checked />
+                <span>PDF 智慧重組：自動濾除重複頁首頁尾/頁碼並合併斷行段落</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optTrimEmptyCells" checked />
+                <span>自動剔除 Excel 空白列、空白欄與空工作表</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optRoundFloats" checked />
+                <span>修正浮點數精度誤差（如 <code>0.30000000004</code> → <code>0.3</code>）</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optIncludeNotes" checked />
+                <span>提取 PPT 投影片備忘稿（Speaker Notes）</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optImagePlaceholder" />
+                <span>保留圖片位置標記 <code>[圖片]</code>（預設完全移除圖片以節省 Token）</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- File List -->
+        <div class="card files-card">
+          <div class="card-header">
+            <h2>📂 已載入檔案 (<span id="fileCount">0</span>)</h2>
+          </div>
+          <ul id="fileList" class="file-list">
+            <li class="empty-hint">尚未放入任何檔案</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- Right Column: Metrics & Output Preview -->
+      <section class="right-panel">
+        <!-- Metrics Bar -->
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <span class="metric-label">原始檔案總體積</span>
+            <strong id="metricRawSize" class="metric-value">0 B</strong>
+            <span class="metric-sub">包含圖片、XML 樣式與冗餘結構</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">轉換後純文字大小</span>
+            <strong id="metricCleanSize" class="metric-value highlight-green">0 B</strong>
+            <span id="metricSizeSaved" class="metric-sub">流量節省 0%</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">預估 AI Token 消耗</span>
+            <strong id="metricTokens" class="metric-value highlight-blue">0</strong>
+            <span id="metricTokenHint" class="metric-sub">支援中英混合估算</span>
+          </div>
+        </div>
+
+        <!-- Output Area -->
+        <div class="card output-card">
+          <div class="card-header output-header">
+            <div class="output-tabs">
+              <h2>🤖 AI 最佳化輸出結果</h2>
+              <span id="activeViewBadge" class="view-badge">合併檢視全部檔案</span>
+            </div>
+            <div class="output-actions">
+              <button id="btnCopyPrompt" class="btn btn-secondary" disabled title="附上 AI 引導指令一併複製">📋 複製含 AI 提示詞</button>
+              <button id="btnCopy" class="btn btn-primary" disabled>📋 複製轉換結果</button>
+              <button id="btnDownload" class="btn btn-secondary" disabled>💾 下載檔案</button>
+            </div>
+          </div>
+
+          <div class="output-body">
+            <textarea id="outputPreview" readonly placeholder="將 PDF (.pdf)、Word (.docx)、PowerPoint (.pptx) 或 Excel (.xlsx/.csv) 檔案拖放到左側，系統將自動辨識格式並轉換為低 Token 消耗的 AI 專用格式..."></textarea>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
