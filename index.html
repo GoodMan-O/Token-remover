@@ -3,15 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Office2AI — 辦公文件轉 AI 低 Token 最佳化工具</title>
+  <title>Office2AI — 辦公文件轉 AI 低 Token 最佳化 & PDF 轉 PPT 工具箱</title>
   <link rel="stylesheet" href="styles.css" />
-  <!-- JSZip for DOCX and PPTX parsing -->
+  <!-- JSZip for DOCX and PPTX parsing/generation -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <!-- SheetJS for Excel (.xlsx, .xls, .csv) parsing -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <!-- PDF.js for PDF parsing (works locally on file:// and http://) -->
+  <!-- PDF.js for PDF parsing & rendering -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+  <!-- PptxGenJS for generating .pptx files -->
+  <script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.min.js"></script>
 </head>
 <body>
   <div class="app-container">
@@ -20,18 +22,31 @@
       <div class="brand">
         <div class="brand-icon">⚡</div>
         <div>
-          <h1>Office2AI 轉換器</h1>
-          <p class="subtitle">自動辨識 PDF、Word、PPT、Excel，去蕪存菁轉換為 AI 易讀、極致省 Token 的結構化文本（100% 本地瀏覽器執行，不傳送至伺服器）</p>
+          <h1>Office2AI 辦公文件工具箱</h1>
+          <p class="subtitle">自動辨識 PDF、Word、PPT、Excel 轉 AI 低 Token 文本，並支援 PDF 轉可編輯 PPT 簡報（100% 本地瀏覽器執行）</p>
         </div>
       </div>
+
+      <!-- Mode Switcher Tabs -->
+      <nav class="mode-tabs" role="tablist">
+        <button id="tabBtnAi" class="mode-tab active" role="tab" aria-selected="true">
+          🤖 轉 AI 省 Token 文本
+        </button>
+        <button id="tabBtnPdf2Ppt" class="mode-tab" role="tab" aria-selected="false">
+          📊 PDF 轉 PPT 簡報
+        </button>
+      </nav>
+
       <div class="header-actions">
         <button id="btnDemo" class="btn btn-secondary" title="載入範例資料測試轉換效果">載入測試範例</button>
         <button id="btnClearAll" class="btn btn-ghost" disabled>清空全部</button>
       </div>
     </header>
 
-    <!-- Main Grid -->
-    <main class="main-grid">
+    <!-- ==========================================
+         TAB 1: 辦公文件轉 AI 省 Token 文本
+         ========================================== -->
+    <main id="panelAi" class="main-grid">
       <!-- Left Column: Dropzone, Settings, File Queue -->
       <section class="left-panel">
         <!-- Upload Dropzone -->
@@ -152,6 +167,131 @@
 
           <div class="output-body">
             <textarea id="outputPreview" readonly placeholder="將 PDF (.pdf)、Word (.docx)、PowerPoint (.pptx) 或 Excel (.xlsx/.csv) 檔案拖放到左側，系統將自動辨識格式並轉換為低 Token 消耗的 AI 專用格式..."></textarea>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ==========================================
+         TAB 2: PDF 轉 PPT 簡報 (雙重混合模式)
+         ========================================== -->
+    <main id="panelPdf2Ppt" class="main-grid hidden">
+      <!-- Left Column: PDF Dropzone, Conversion Mode Settings, PDF Queue -->
+      <section class="left-panel">
+        <div id="pdf2pptDropzone" class="dropzone dropzone-ppt" tabindex="0">
+          <input type="file" id="pdf2pptFileInput" multiple accept=".pdf" hidden />
+          <div class="dropzone-content">
+            <div class="upload-icon">📊</div>
+            <h3>拖放 PDF 檔案至此，轉換為 PowerPoint (.pptx)</h3>
+            <p>支援「可編輯文字方塊重組」、「100% 高畫質頁面不跑版」與「雙重混合模式」</p>
+            <div class="format-badges">
+              <span class="badge badge-pdf">PDF (.pdf)</span>
+              <span class="badge badge-arrow">➔</span>
+              <span class="badge badge-ppt">PowerPoint (.pptx)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- PDF to PPT Conversion Settings -->
+        <div class="card settings-card">
+          <div class="card-header">
+            <h2>⚙️ PDF 轉 PPT 轉換模式設定</h2>
+          </div>
+          <div class="settings-body">
+            <div class="form-group">
+              <label for="pptConvertMode">PPT 轉換模式（支援雙重混合選項）</label>
+              <select id="pptConvertMode">
+                <option value="hybrid" selected>🌟 雙重混合模式（推薦：底層保留原排版視覺 + 上層疊加可編輯文字框 + 備忘稿）</option>
+                <option value="editable">✏️ 文字可編輯模式（結構重組：依 PDF 座標與字級建立可修改的文字方塊）</option>
+                <option value="image">🖼️ 排版 100% 不跑版模式（高畫質頁面轉投影片 + 自動將文字填入備忘稿）</option>
+              </select>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-group">
+                <label for="pptLayout">投影片尺寸比例</label>
+                <select id="pptLayout">
+                  <option value="auto" selected>自動依 PDF 原比例（推薦）</option>
+                  <option value="16x9">16:9 寬螢幕簡報</option>
+                  <option value="16x10">16:10 寬螢幕簡報</option>
+                  <option value="4x3">4:3 傳統簡報</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="pptScale">頁面渲染解析度</label>
+                <select id="pptScale">
+                  <option value="1.5">1.5x 標準（檔案較小）</option>
+                  <option value="2" selected>2.0x 高畫質（推薦）</option>
+                  <option value="3">3.0x 超高畫質（適合大投影）</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="checkbox-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="optPptMergeBlocks" checked />
+                <span>智慧段落合併：將相鄰斷行合併為完整 PPT 文字方塊（更好編輯）</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optPptIncludeNotes" checked />
+                <span>自動將每頁完整文字寫入 PPT 下方「演講者備忘稿」</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="optPptHideBgText" checked />
+                <span>在「雙重混合模式」下自動淡化背景圖層（凸顯上層可編輯文字方塊）</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- PDF Queue List -->
+        <div class="card files-card">
+          <div class="card-header">
+            <h2>📂 待轉換 PDF 檔案 (<span id="pdf2pptFileCount">0</span>)</h2>
+          </div>
+          <ul id="pdf2pptFileList" class="file-list">
+            <li class="empty-hint">尚未放入 PDF 檔案（在第一分頁載入的 PDF 也會自動同步至此）</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- Right Column: Slide Preview & Export -->
+      <section class="right-panel">
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <span class="metric-label">目前檢視 PDF 頁數</span>
+            <strong id="pptMetricPages" class="metric-value">0 頁</strong>
+            <span class="metric-sub">每頁將轉換為 1 張 PPT 投影片</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">可編輯文字方塊數</span>
+            <strong id="pptMetricBlocks" class="metric-value highlight-amber">0 個</strong>
+            <span class="metric-sub">自動偵測座標、字級與標題層級</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">目前輸出模式</span>
+            <strong id="pptMetricMode" class="metric-value highlight-blue">雙重混合</strong>
+            <span id="pptMetricHint" class="metric-sub">底圖保真 + 上層可編輯文字框</span>
+          </div>
+        </div>
+
+        <div class="card output-card">
+          <div class="card-header output-header">
+            <div class="output-tabs">
+              <h2>📊 投影片結構與視覺預覽</h2>
+              <span id="pptActiveFileBadge" class="view-badge">請先拖放 PDF 檔案</span>
+            </div>
+            <div class="output-actions">
+              <button id="btnExportPptx" class="btn btn-ppt" disabled>📊 下載 PowerPoint (.pptx)</button>
+            </div>
+          </div>
+
+          <div id="pptSlidesPreview" class="slides-preview-container">
+            <div class="slides-empty-state">
+              <div class="empty-icon">📊</div>
+              <h3>將 PDF 拖放到左側，即可預覽投影片並匯出 `.pptx`</h3>
+              <p>支援保留原檔案名稱下載，亦可點擊右上角「載入測試範例」立即體驗 PDF 轉 PPT 效果</p>
+            </div>
           </div>
         </div>
       </section>

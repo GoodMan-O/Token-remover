@@ -4,11 +4,19 @@
  */
 
 const state = {
+  activeMode: "ai", // "ai" | "pdf2ppt"
   files: [], // Array of { id, name, rawSize, detectedType, parsedData, error }
-  selectedFileId: null, // null means "view all merged"
+  selectedFileId: null, // null means "view all merged" in AI tab
+  selectedPdfId: null, // selected PDF file id in PDF2PPT tab
 };
 
-// DOM Elements
+// DOM Elements - Header & Mode Tabs
+const tabBtnAi = document.getElementById("tabBtnAi");
+const tabBtnPdf2Ppt = document.getElementById("tabBtnPdf2Ppt");
+const panelAi = document.getElementById("panelAi");
+const panelPdf2Ppt = document.getElementById("panelPdf2Ppt");
+
+// DOM Elements - Tab 1 (AI Converter)
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("fileInput");
 const fileListEl = document.getElementById("fileList");
@@ -28,7 +36,20 @@ const btnCopy = document.getElementById("btnCopy");
 const btnCopyPrompt = document.getElementById("btnCopyPrompt");
 const btnDownload = document.getElementById("btnDownload");
 
-/// Settings Elements
+// DOM Elements - Tab 2 (PDF to PPT)
+const pdf2pptDropzone = document.getElementById("pdf2pptDropzone");
+const pdf2pptFileInput = document.getElementById("pdf2pptFileInput");
+const pdf2pptFileListEl = document.getElementById("pdf2pptFileList");
+const pdf2pptFileCountEl = document.getElementById("pdf2pptFileCount");
+const pptMetricPages = document.getElementById("pptMetricPages");
+const pptMetricBlocks = document.getElementById("pptMetricBlocks");
+const pptMetricMode = document.getElementById("pptMetricMode");
+const pptMetricHint = document.getElementById("pptMetricHint");
+const pptActiveFileBadge = document.getElementById("pptActiveFileBadge");
+const btnExportPptx = document.getElementById("btnExportPptx");
+const pptSlidesPreview = document.getElementById("pptSlidesPreview");
+
+// Settings Elements
 const settingIds = [
   "outputFormat",
   "tableFormat",
@@ -40,11 +61,39 @@ const settingIds = [
   "optImagePlaceholder",
 ];
 
+const pptSettingIds = [
+  "pptConvertMode",
+  "pptLayout",
+  "pptScale",
+  "optPptMergeBlocks",
+  "optPptIncludeNotes",
+  "optPptHideBgText",
+];
+
+function switchMode(mode) {
+  state.activeMode = mode;
+  if (tabBtnAi && tabBtnPdf2Ppt && panelAi && panelPdf2Ppt) {
+    const isAi = mode === "ai";
+    tabBtnAi.classList.toggle("active", isAi);
+    tabBtnAi.setAttribute("aria-selected", String(isAi));
+    tabBtnPdf2Ppt.classList.toggle("active", !isAi);
+    tabBtnPdf2Ppt.setAttribute("aria-selected", String(!isAi));
+    panelAi.classList.toggle("hidden", !isAi);
+    panelPdf2Ppt.classList.toggle("hidden", isAi);
+  }
+  renderAll();
+}
+
 // Initialize Event Listeners
 function init() {
   if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
     window.pdfjsLib.GlobalWorkerOptions.workerSrc =
       "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  }
+
+  if (tabBtnAi && tabBtnPdf2Ppt) {
+    tabBtnAi.addEventListener("click", () => switchMode("ai"));
+    tabBtnPdf2Ppt.addEventListener("click", () => switchMode("pdf2ppt"));
   }
 
   dropzone.addEventListener("click", () => fileInput.click());
@@ -76,10 +125,46 @@ function init() {
     }
   });
 
-  settingIds.forEach((id) => {
-    document.getElementById(id).addEventListener("change", () => {
-      renderAll();
+  // Tab 2: PDF-to-PPT Dropzone Listeners
+  if (pdf2pptDropzone && pdf2pptFileInput) {
+    pdf2pptDropzone.addEventListener("click", () => pdf2pptFileInput.click());
+    pdf2pptDropzone.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") pdf2pptFileInput.click();
     });
+
+    pdf2pptDropzone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      pdf2pptDropzone.classList.add("dragover");
+    });
+
+    pdf2pptDropzone.addEventListener("dragleave", () => {
+      pdf2pptDropzone.classList.remove("dragover");
+    });
+
+    pdf2pptDropzone.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      pdf2pptDropzone.classList.remove("dragover");
+      if (e.dataTransfer.files?.length) {
+        await handleFiles(Array.from(e.dataTransfer.files));
+      }
+    });
+
+    pdf2pptFileInput.addEventListener("change", async (e) => {
+      if (e.target.files?.length) {
+        await handleFiles(Array.from(e.target.files));
+        pdf2pptFileInput.value = "";
+      }
+    });
+  }
+
+  settingIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", () => renderAll());
+  });
+
+  pptSettingIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", () => renderAll());
   });
 
   activeViewBadge.addEventListener("click", () => {
@@ -90,6 +175,7 @@ function init() {
   btnClearAll.addEventListener("click", () => {
     state.files = [];
     state.selectedFileId = null;
+    state.selectedPdfId = null;
     renderAll();
     showToast("已清空所有檔案");
   });
@@ -105,6 +191,12 @@ function init() {
   });
 
   btnDownload.addEventListener("click", downloadResult);
+  if (btnExportPptx) {
+    btnExportPptx.addEventListener("click", () => {
+      const targetPdf = getActivePdfFile();
+      if (targetPdf) exportPdfToPptx(targetPdf);
+    });
+  }
   btnDemo.addEventListener("click", loadDemoFiles);
 }
 
@@ -488,8 +580,9 @@ async function parsePdf(arrayBuffer) {
     throw new Error("PDF.js 尚未載入，請確認網路連線或重新整理頁面");
   }
 
+  const pdfBytes = new Uint8Array(arrayBuffer.slice(0));
   const loadingTask = window.pdfjsLib.getDocument({
-    data: new Uint8Array(arrayBuffer),
+    data: new Uint8Array(pdfBytes),
     useSystemFonts: true,
     disableFontFace: true,
   });
@@ -500,7 +593,30 @@ async function parsePdf(arrayBuffer) {
 
   for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
     const page = await pdfDoc.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1.0 });
+    const pageWidthPt = viewport.width || 612;
+    const pageHeightPt = viewport.height || 792;
     const textContent = await page.getTextContent();
+
+    // Render thumbnail preview for PDF-to-PPT tab if canvas is supported
+    let thumbDataUrl = "";
+    try {
+      const thumbCanvas = document.createElement("canvas");
+      if (thumbCanvas && typeof thumbCanvas.getContext === "function") {
+        const thumbViewport = page.getViewport({ scale: 0.8 });
+        thumbCanvas.width = Math.ceil(thumbViewport.width);
+        thumbCanvas.height = Math.ceil(thumbViewport.height);
+        const ctx = thumbCanvas.getContext("2d");
+        if (ctx) {
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
+          await page.render({ canvasContext: ctx, viewport: thumbViewport }).promise;
+          thumbDataUrl = thumbCanvas.toDataURL("image/png");
+        }
+      }
+    } catch (_) {
+      // Ignore thumbnail rendering errors in headless environments
+    }
 
     // Extract text items with coordinates and font size
     const items = [];
@@ -510,12 +626,13 @@ async function parsePdf(arrayBuffer) {
       const x = tx[4];
       const y = tx[5];
       const fontSize = Math.round(Math.hypot(tx[0], tx[1]) || item.height || 12);
+      const itemWidth = item.width || item.str.length * fontSize * 0.52;
       allFontSizes.push(fontSize);
       items.push({
         str: item.str,
         x,
         y,
-        width: item.width || 0,
+        width: itemWidth,
         fontSize,
       });
     }
@@ -546,13 +663,15 @@ async function parsePdf(arrayBuffer) {
       }
     }
 
-    // Join items within each line
+    // Join items within each line and calculate bounding box in top-left origin PDF points
     const lines = lineGroups
       .map((group) => {
         group.items.sort((a, b) => a.x - b.x);
         let lineText = "";
         let prevEnd = null;
         let prevChar = "";
+        const minX = group.items[0].x;
+        let maxEnd = minX;
 
         for (const it of group.items) {
           const text = it.str;
@@ -571,18 +690,34 @@ async function parsePdf(arrayBuffer) {
           }
           lineText += text;
           prevEnd = it.x + (it.width || text.length * group.fontSize * 0.5);
+          if (prevEnd > maxEnd) maxEnd = prevEnd;
           prevChar = text.charAt(text.length - 1);
         }
+
+        // Convert baseline PDF Y (bottom-up) to top-down Y coordinate
+        const yTopPt = Math.max(0, pageHeightPt - group.y - group.fontSize * 0.88);
+        const widthPt = Math.max(group.fontSize, maxEnd - minX);
+        const heightPt = group.fontSize * 1.3;
 
         return {
           text: lineText.trim(),
           fontSize: group.fontSize,
           y: group.y,
+          xPt: Math.max(0, minX),
+          yTopPt,
+          widthPt,
+          heightPt,
         };
       })
       .filter((l) => l.text.length > 0);
 
-    rawPages.push({ pageNumber: pageNum, lines });
+    rawPages.push({
+      pageNumber: pageNum,
+      pageWidthPt,
+      pageHeightPt,
+      thumbDataUrl,
+      lines,
+    });
   }
 
   // Determine median body font size for heading detection
@@ -628,11 +763,14 @@ async function parsePdf(arrayBuffer) {
     });
     return {
       pageNumber: p.pageNumber,
+      pageWidthPt: p.pageWidthPt,
+      pageHeightPt: p.pageHeightPt,
+      thumbDataUrl: p.thumbDataUrl,
       lines: markedLines,
     };
   });
 
-  return { docType: "pdf", pages, bodyFontSize };
+  return { docType: "pdf", pages, bodyFontSize, pdfBytes };
 }
 
 function formatPdfPages(parsedData, settings) {
@@ -1041,6 +1179,7 @@ function renderAll() {
         e.stopPropagation();
         state.files = state.files.filter((item) => item.id !== f.id);
         if (state.selectedFileId === f.id) state.selectedFileId = null;
+        if (state.selectedPdfId === f.id) state.selectedPdfId = null;
         renderAll();
       });
 
@@ -1113,6 +1252,564 @@ function renderAll() {
   } else {
     metricTokenHint.textContent = "支援中英混合估算";
   }
+
+  // Also update Tab 2 (PDF to PPT)
+  renderPdf2PptPanel();
+}
+
+/* =========================================================
+ * TAB 2: PDF 轉 PPT 簡報引擎（雙重混合 / 可編輯文字框 / 高保真圖片）
+ * ========================================================= */
+function getPptSettings() {
+  const modeEl = document.getElementById("pptConvertMode");
+  const layoutEl = document.getElementById("pptLayout");
+  const scaleEl = document.getElementById("pptScale");
+  const mergeEl = document.getElementById("optPptMergeBlocks");
+  const notesEl = document.getElementById("optPptIncludeNotes");
+  const hideBgEl = document.getElementById("optPptHideBgText");
+
+  return {
+    mode: modeEl ? modeEl.value : "hybrid",
+    layout: layoutEl ? layoutEl.value : "auto",
+    scale: scaleEl ? parseFloat(scaleEl.value) || 2 : 2,
+    mergeBlocks: mergeEl ? mergeEl.checked : true,
+    includeNotes: notesEl ? notesEl.checked : true,
+    hideBgText: hideBgEl ? hideBgEl.checked : true,
+  };
+}
+
+function getPdfFiles() {
+  return state.files.filter((f) => f.detectedType === "pdf" && !f.error && f.parsedData);
+}
+
+function getActivePdfFile() {
+  const pdfFiles = getPdfFiles();
+  if (pdfFiles.length === 0) return null;
+  if (state.selectedPdfId) {
+    const found = pdfFiles.find((f) => f.id === state.selectedPdfId);
+    if (found) return found;
+  }
+  state.selectedPdfId = pdfFiles[0].id;
+  return pdfFiles[0];
+}
+
+/**
+ * 將單頁 PDF 的視覺行重組為 PPT 可編輯文字方塊（含精確座標與字級）
+ */
+function getPptTextBlocksForPage(page, bodyFontSize, mergeBlocks) {
+  if (!page || !page.lines || page.lines.length === 0) return [];
+
+  if (!mergeBlocks) {
+    return page.lines.map((line) => ({
+      text: line.text,
+      fontSize: line.fontSize,
+      isHeading: Boolean(line.isHeading),
+      xPt: line.xPt ?? 40,
+      yTopPt: line.yTopPt ?? 40,
+      widthPt: line.widthPt ?? 400,
+      heightPt: line.heightPt ?? line.fontSize * 1.35,
+    }));
+  }
+
+  // Merge adjacent lines that belong to the same visual paragraph / list block
+  const blocks = [];
+  for (const line of page.lines) {
+    const prev = blocks[blocks.length - 1];
+    const lineX = line.xPt ?? 40;
+    const lineY = line.yTopPt ?? 40;
+    const lineW = line.widthPt ?? 400;
+    const lineH = line.heightPt ?? line.fontSize * 1.35;
+
+    if (prev) {
+      const prevBottom = prev.yTopPt + prev.heightPt;
+      const verticalGap = lineY - prevBottom;
+      const sameFontTier = Math.abs(prev.fontSize - line.fontSize) <= 2 && prev.isHeading === Boolean(line.isHeading);
+      const alignedLeft = Math.abs(prev.xPt - lineX) <= prev.fontSize * 2.5;
+      const isNewHeadingOrFooter = line.isHeading || line.isHeaderFooterOrPageNum || prev.isHeaderFooterOrPageNum;
+
+      if (!isNewHeadingOrFooter && sameFontTier && alignedLeft && verticalGap >= -4 && verticalGap <= prev.fontSize * 1.1) {
+        prev.text += "\n" + line.text;
+        const rightEdge = Math.max(prev.xPt + prev.widthPt, lineX + lineW);
+        prev.xPt = Math.min(prev.xPt, lineX);
+        prev.widthPt = rightEdge - prev.xPt;
+        prev.heightPt = Math.max(prev.heightPt + lineH, lineY + lineH - prev.yTopPt);
+        continue;
+      }
+    }
+
+    blocks.push({
+      text: line.text,
+      fontSize: line.fontSize,
+      isHeading: Boolean(line.isHeading),
+      isHeaderFooterOrPageNum: Boolean(line.isHeaderFooterOrPageNum),
+      xPt: lineX,
+      yTopPt: lineY,
+      widthPt: lineW,
+      heightPt: lineH,
+    });
+  }
+
+  return blocks;
+}
+
+function renderPdf2PptPanel() {
+  if (!pdf2pptFileListEl || !pptSlidesPreview) return;
+
+  const pdfFiles = getPdfFiles();
+  const pptSettings = getPptSettings();
+  pdf2pptFileCountEl.textContent = pdfFiles.length;
+
+  // Update Mode Metric Display
+  if (pptSettings.mode === "hybrid") {
+    pptMetricMode.textContent = "雙重混合";
+    pptMetricHint.textContent = "底圖保真 + 上層可編輯文字框";
+  } else if (pptSettings.mode === "editable") {
+    pptMetricMode.textContent = "純文字可編輯";
+    pptMetricHint.textContent = "依座標重組可修改的 PPT 文字框";
+  } else {
+    pptMetricMode.textContent = "100% 不跑版";
+    pptMetricHint.textContent = "高畫質頁面背景 + 備忘稿全文";
+  }
+
+  if (pdfFiles.length === 0) {
+    pdf2pptFileListEl.innerHTML = `<li class="empty-hint">尚未放入 PDF 檔案（在第一分頁載入的 PDF 也會自動同步至此）</li>`;
+    pptMetricPages.textContent = "0 頁";
+    pptMetricBlocks.textContent = "0 個";
+    pptActiveFileBadge.textContent = "請先拖放 PDF 檔案";
+    btnExportPptx.disabled = true;
+    btnExportPptx.textContent = "📊 下載 PowerPoint (.pptx)";
+    pptSlidesPreview.innerHTML = `
+      <div class="slides-empty-state">
+        <div class="empty-icon">📊</div>
+        <h3>將 PDF 拖放到左側，即可預覽投影片並匯出 .pptx</h3>
+        <p>支援保留原檔案名稱下載，亦可點擊右上角「載入測試範例」立即體驗 PDF 轉 PPT 效果</p>
+      </div>
+    `;
+    return;
+  }
+
+  const activePdf = getActivePdfFile();
+
+  // Render PDF File Queue List
+  pdf2pptFileListEl.innerHTML = "";
+  pdfFiles.forEach((f) => {
+    const li = document.createElement("li");
+    li.className = "file-item" + (activePdf && activePdf.id === f.id ? " active" : "");
+    const pageCount = f.parsedData.pages.length;
+    const pptxName = `${getBaseFileName(f.name)}.pptx`;
+
+    li.innerHTML = `
+      <div class="file-info">
+        <span class="file-type-tag badge-pdf">PDF</span>
+        <div class="file-meta">
+          <div class="file-name" title="${f.name}">${f.name}</div>
+          <div class="file-stats">共 ${pageCount} 頁 · 輸出檔名：${pptxName}</div>
+        </div>
+      </div>
+      <div class="file-actions">
+        <button class="file-download" title="立即轉換並下載 ${pptxName}">📊</button>
+        <button class="file-remove" title="移除此檔案">✕</button>
+      </div>
+    `;
+
+    li.addEventListener("click", (e) => {
+      if (e.target.closest(".file-remove") || e.target.closest(".file-download")) return;
+      state.selectedPdfId = f.id;
+      renderAll();
+    });
+
+    li.querySelector(".file-download").addEventListener("click", (e) => {
+      e.stopPropagation();
+      exportPdfToPptx(f);
+    });
+
+    li.querySelector(".file-remove").addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.files = state.files.filter((item) => item.id !== f.id);
+      if (state.selectedFileId === f.id) state.selectedFileId = null;
+      if (state.selectedPdfId === f.id) state.selectedPdfId = null;
+      renderAll();
+    });
+
+    pdf2pptFileListEl.appendChild(li);
+  });
+
+  // Render Active PDF Slide Cards & Metrics
+  const pages = activePdf.parsedData.pages;
+  const bodyFontSize = activePdf.parsedData.bodyFontSize || 12;
+  let totalBlocks = 0;
+
+  const slideCardsHtml = pages
+    .map((page) => {
+      const blocks = getPptTextBlocksForPage(page, bodyFontSize, pptSettings.mergeBlocks);
+      totalBlocks += blocks.length;
+
+      const thumbHtml = page.thumbDataUrl
+        ? `<img src="${page.thumbDataUrl}" alt="Slide ${page.pageNumber}" />`
+        : `<div style="padding:36px 12px;color:#475569;font-size:0.8rem;text-align:center;">第 ${page.pageNumber} 頁預覽</div>`;
+
+      const blockItemsHtml =
+        blocks.length > 0
+          ? blocks
+              .map((b) => {
+                const escaped = b.text
+                  .replace(/&/g, "&amp;")
+                  .replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;")
+                  .replace(/\n/g, " ↵ ");
+                const tag = b.isHeading ? `標題 ${b.fontSize}pt` : `${b.fontSize}pt`;
+                return `
+                  <div class="slide-text-box-item">
+                    <span class="slide-text-box-meta">[${tag}]</span>
+                    <span>${escaped}</span>
+                  </div>
+                `;
+              })
+              .join("")
+          : `<div class="slide-text-box-item"><span>（此頁為純圖片或無文字圖層，將以高畫質影像呈現）</span></div>`;
+
+      const modeBadgeText =
+        pptSettings.mode === "image"
+          ? `高畫質背景圖 + 備忘稿文字`
+          : `可編輯文字方塊 x ${blocks.length}`;
+
+      return `
+        <div class="slide-card">
+          <div class="slide-thumb-wrap">
+            <span class="slide-num-tag">Slide ${page.pageNumber}</span>
+            ${thumbHtml}
+          </div>
+          <div class="slide-details">
+            <div class="slide-details-header">
+              <h4>第 ${page.pageNumber} 頁投影片 (${Math.round(page.pageWidthPt)} × ${Math.round(page.pageHeightPt)} pt)</h4>
+              <span class="slide-box-badge">${modeBadgeText}</span>
+            </div>
+            <div class="slide-text-list">
+              ${blockItemsHtml}
+            </div>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  pptSlidesPreview.innerHTML = slideCardsHtml;
+  pptMetricPages.textContent = `${pages.length} 頁`;
+  pptMetricBlocks.textContent = pptSettings.mode === "image" ? `0 個 (純圖+備忘)` : `${totalBlocks} 個`;
+  pptActiveFileBadge.textContent = `預覽中：${activePdf.name}`;
+
+  const outPptxName = `${getBaseFileName(activePdf.name)}.pptx`;
+  btnExportPptx.disabled = false;
+  btnExportPptx.textContent = `📊 下載 ${outPptxName}`;
+  btnExportPptx.title = `將 ${activePdf.name} 轉換為 ${outPptxName}`;
+}
+
+/**
+ * 將指定 PDF 檔案依高解析度渲染並轉換為可編輯 .pptx 簡報下載（保留原檔案名稱）
+ */
+async function exportPdfToPptx(pdfFileObj) {
+  if (!pdfFileObj || !pdfFileObj.parsedData) return;
+
+  const pptSettings = getPptSettings();
+  const outFileName = `${getBaseFileName(pdfFileObj.name)}.pptx`;
+  const origBtnText = btnExportPptx ? btnExportPptx.textContent : "";
+
+  try {
+    if (btnExportPptx) {
+      btnExportPptx.disabled = true;
+      btnExportPptx.textContent = "⏳ 正在生成 PPTX...";
+    }
+    showToast(`正在將 ${pdfFileObj.name} 轉換為 PowerPoint 簡報...`);
+
+    const { pages, bodyFontSize, pdfBytes } = pdfFileObj.parsedData;
+    const firstPage = pages[0] || { pageWidthPt: 612, pageHeightPt: 792 };
+
+    // Determine Slide Dimensions in Inches
+    let slideW = 10;
+    let slideH = 5.625;
+    if (pptSettings.layout === "16x9") {
+      slideW = 10;
+      slideH = 5.625;
+    } else if (pptSettings.layout === "16x10") {
+      slideW = 10;
+      slideH = 6.25;
+    } else if (pptSettings.layout === "4x3") {
+      slideW = 10;
+      slideH = 7.5;
+    } else {
+      // Auto match PDF page aspect ratio (base width = 10 inches)
+      const ratio = (firstPage.pageHeightPt || 792) / (firstPage.pageWidthPt || 612);
+      slideW = 10;
+      slideH = Number(Math.max(4, Math.min(14, 10 * ratio)).toFixed(3));
+    }
+
+    // Render high-res page images if mode is "image" or "hybrid"
+    const pageImages = [];
+    if ((pptSettings.mode === "image" || pptSettings.mode === "hybrid") && pdfBytes && window.pdfjsLib) {
+      const loadingTask = window.pdfjsLib.getDocument({
+        data: new Uint8Array(pdfBytes),
+        useSystemFonts: true,
+        disableFontFace: true,
+      });
+      const pdfDoc = await loadingTask.promise;
+
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const vp = page.getViewport({ scale: pptSettings.scale });
+        const canvas = document.createElement("canvas");
+        if (canvas && typeof canvas.getContext === "function") {
+          canvas.width = Math.ceil(vp.width);
+          canvas.height = Math.ceil(vp.height);
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          await page.render({ canvasContext: ctx, viewport: vp }).promise;
+          pageImages.push(canvas.toDataURL("image/png"));
+        } else {
+          pageImages.push(pages[i - 1]?.thumbDataUrl || "");
+        }
+      }
+    }
+
+    // Use PptxGenJS if available, otherwise fallback to native JSZip OpenXML builder
+    if (window.PptxGenJS) {
+      const pptx = new window.PptxGenJS();
+      pptx.defineLayout({ name: "PDF_CUSTOM", width: slideW, height: slideH });
+      pptx.layout = "PDF_CUSTOM";
+      pptx.title = getBaseFileName(pdfFileObj.name);
+
+      pages.forEach((page, idx) => {
+        const slide = pptx.addSlide();
+        const pW = page.pageWidthPt || 612;
+        const pH = page.pageHeightPt || 792;
+        const blocks = getPptTextBlocksForPage(page, bodyFontSize || 12, pptSettings.mergeBlocks);
+        const imgData = pageImages[idx] || page.thumbDataUrl || "";
+
+        // 1. Add Background / Raster Layer for "image" or "hybrid" mode
+        if ((pptSettings.mode === "image" || pptSettings.mode === "hybrid") && imgData) {
+          slide.addImage({
+            data: imgData,
+            x: 0,
+            y: 0,
+            w: slideW,
+            h: slideH,
+          });
+          if (pptSettings.mode === "hybrid" && pptSettings.hideBgText) {
+            // Add subtle translucent overlay so editable text boxes pop cleanly while preserving visuals
+            slide.addShape(pptx.ShapeType ? pptx.ShapeType.rect : "rect", {
+              x: 0,
+              y: 0,
+              w: slideW,
+              h: slideH,
+              fill: { color: "FFFFFF", transparency: 25 },
+              line: { color: "FFFFFF", width: 0 },
+            });
+          }
+        }
+
+        // 2. Add Editable Text Boxes for "editable" or "hybrid" mode
+        if (pptSettings.mode === "editable" || pptSettings.mode === "hybrid") {
+          const scaleFactor = slideW / (pW / 72);
+          for (const b of blocks) {
+            const xIn = Number(Math.max(0.1, Math.min(slideW - 0.5, (b.xPt / pW) * slideW)).toFixed(3));
+            const yIn = Number(Math.max(0.08, Math.min(slideH - 0.3, (b.yTopPt / pH) * slideH)).toFixed(3));
+            const wIn = Number(
+              Math.max(1.0, Math.min(slideW - xIn - 0.08, (b.widthPt / pW) * slideW + 0.35)).toFixed(3)
+            );
+            const hIn = Number(Math.max(0.32, Math.min(slideH - yIn, (b.heightPt / pH) * slideH + 0.12)).toFixed(3));
+            const scaledFontPt = Math.max(8, Math.min(44, Math.round(b.fontSize * scaleFactor * 0.72)));
+
+            const textOpts = {
+              x: xIn,
+              y: yIn,
+              w: wIn,
+              h: hIn,
+              fontSize: scaledFontPt,
+              bold: Boolean(b.isHeading),
+              color: b.isHeading ? "0F172A" : "1E293B",
+              valign: "top",
+              margin: 2,
+              breakLine: true,
+            };
+
+            if (pptSettings.mode === "hybrid" && pptSettings.hideBgText) {
+              textOpts.fill = { color: "FFFFFF", transparency: 5 };
+            }
+
+            slide.addText(b.text, textOpts);
+          }
+        }
+
+        // 3. Add Speaker Notes if enabled
+        if (pptSettings.includeNotes || pptSettings.mode === "image") {
+          const noteText = page.lines.map((l) => l.text).join("\n");
+          if (noteText) {
+            slide.addNotes(noteText);
+          }
+        }
+      });
+
+      await pptx.writeFile({ fileName: outFileName });
+    } else {
+      // Built-in JSZip OpenXML PPTX fallback generator
+      const blob = await buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pptSettings, pageImages);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = outFileName;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    showToast(`已成功下載 ${outFileName}！`);
+  } catch (err) {
+    console.error("匯出 PPTX 失敗:", err);
+    showToast(`匯出 PPTX 失敗：${err.message || "未知錯誤"}`);
+  } finally {
+    if (btnExportPptx) {
+      btnExportPptx.disabled = false;
+      btnExportPptx.textContent = origBtnText || `📊 下載 ${outFileName}`;
+    }
+  }
+}
+
+/**
+ * 原生 JSZip OpenXML (.pptx) 備援產生器（確保無外部 CDN 時依然能產生可編輯 .pptx）
+ */
+async function buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pptSettings, pageImages) {
+  const zip = new JSZip();
+  const emuPerInch = 914400;
+  const cx = Math.round(slideW * emuPerInch);
+  const cy = Math.round(slideH * emuPerInch);
+
+  const escapeXml = (s) =>
+    String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+  const slideOverrides = pages
+    .map(
+      (_, i) =>
+        `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`
+    )
+    .join("");
+
+  zip.file(
+    "[Content_Types].xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+      <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+      <Default Extension="xml" ContentType="application/xml"/>
+      <Default Extension="png" ContentType="image/png"/>
+      <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+      ${slideOverrides}
+    </Types>`
+  );
+
+  zip.file(
+    "_rels/.rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+    </Relationships>`
+  );
+
+  const sldIdLst = pages.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join("");
+  zip.file(
+    "ppt/presentation.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                    xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+      <p:sldIdLst>${sldIdLst}</p:sldIdLst>
+      <p:sldSz cx="${cx}" cy="${cy}"/>
+      <p:notesSz cx="${cy}" cy="${cx}"/>
+    </p:presentation>`
+  );
+
+  const presRels = pages
+    .map(
+      (_, i) =>
+        `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i + 1}.xml"/>`
+    )
+    .join("");
+
+  zip.file(
+    "ppt/_rels/presentation.xml.rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      ${presRels}
+    </Relationships>`
+  );
+
+  pages.forEach((page, idx) => {
+    const slideNum = idx + 1;
+    const pW = page.pageWidthPt || 612;
+    const pH = page.pageHeightPt || 792;
+    const blocks = getPptTextBlocksForPage(page, bodyFontSize || 12, pptSettings.mergeBlocks);
+
+    let shapesXml = "";
+    let shapeId = 2;
+
+    if (pptSettings.mode === "editable" || pptSettings.mode === "hybrid") {
+      blocks.forEach((b) => {
+        const xEmu = Math.round((b.xPt / pW) * cx);
+        const yEmu = Math.round((b.yTopPt / pH) * cy);
+        const wEmu = Math.round(Math.max(0.8 * emuPerInch, (b.widthPt / pW) * cx));
+        const hEmu = Math.round(Math.max(0.3 * emuPerInch, (b.heightPt / pH) * cy));
+        const fontHundredths = Math.max(800, Math.round(b.fontSize * 100));
+        const parasXml = b.text
+          .split("\n")
+          .map(
+            (line) =>
+              `<a:p><a:r><a:rPr lang="zh-TW" sz="${fontHundredths}" b="${b.isHeading ? 1 : 0}"/><a:t>${escapeXml(line)}</a:t></a:r></a:p>`
+          )
+          .join("");
+
+        shapesXml += `
+          <p:sp>
+            <p:nvSpPr>
+              <p:cNvPr id="${shapeId++}" name="TextBox ${shapeId}"/>
+              <p:cNvSpPr txBox="1"/>
+              <p:nvPr/>
+            </p:nvSpPr>
+            <p:spPr>
+              <a:xfrm><a:off x="${xEmu}" y="${yEmu}"/><a:ext cx="${wEmu}" cy="${hEmu}"/></a:xfrm>
+              <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+            </p:spPr>
+            <p:txBody>
+              <a:bodyPr wrap="square" rtlCol="0"/>
+              <a:lstStyle/>
+              ${parasXml}
+            </p:txBody>
+          </p:sp>
+        `;
+      });
+    }
+
+    zip.file(
+      `ppt/slides/slide${slideNum}.xml`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+      <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+             xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+        <p:cSld>
+          <p:spTree>
+            <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+            <p:grpSpPr/>
+            ${shapesXml}
+          </p:spTree>
+        </p:cSld>
+      </p:sld>`
+    );
+  });
+
+  return await zip.generateAsync({
+    type: "blob",
+    mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  });
 }
 
 /* =========================================================
