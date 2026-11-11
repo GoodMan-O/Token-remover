@@ -1382,17 +1382,23 @@ function renderAll() {
       const tokens = estimateTokens(singleOut);
 
       let badgeClass = "badge-text";
-      if (f.detectedType === "pdf") badgeClass = "badge-pdf";
+      if (f.detectedType === "image") badgeClass = "badge-image";
+      else if (f.detectedType === "pdf") badgeClass = "badge-pdf";
       else if (f.detectedType === "docx") badgeClass = "badge-word";
       else if (f.detectedType === "pptx") badgeClass = "badge-ppt";
       else if (f.detectedType === "xlsx" || f.detectedType === "csv") badgeClass = "badge-excel";
+
+      const ocrMeta =
+        f.detectedType === "image" && f.parsedData?.ocrConfidence
+          ? ` · 辨識信心 ${f.parsedData.ocrConfidence}%`
+          : "";
 
       li.innerHTML = `
         <div class="file-info">
           <span class="file-type-tag ${badgeClass}">${f.typeLabel}</span>
           <div class="file-meta">
             <div class="file-name" title="${f.name}">${f.name}</div>
-            <div class="file-stats">${formatBytes(f.rawSize)} → ${formatBytes(cleanBytes)} · 約 ${tokens.toLocaleString()} tokens</div>
+            <div class="file-stats">${formatBytes(f.rawSize)} → ${formatBytes(cleanBytes)} · 約 ${tokens.toLocaleString()} tokens${ocrMeta}</div>
           </div>
         </div>
         <div class="file-actions">
@@ -1487,10 +1493,10 @@ function renderAll() {
       metricTokenHint.textContent = `已去除所有 XML 與排版冗餘標籤`;
     }
   } else {
-    metricTokenHint.textContent = "支援中英混合估算";
+    metricTokenHint.textContent = "支援中英越混合估算";
   }
 
-  // Also update Tab 2 (PDF to PPT)
+  // Also update Tab 2 (PDF / Image to PPT)
   renderPdf2PptPanel();
 }
 
@@ -1590,52 +1596,88 @@ function getPptTextBlocksForPage(page, bodyFontSize, mergeBlocks) {
 }
 
 /**
- * 智慧抹除底圖上的原始文字像素（以文字上下邊緣的真實背景色進行垂直插值修補，100% 保留圖案與漸層原色、絕不變淡）
+ * 渲染 PDF 頁面至 Canvas；當 hideText 為 true 時，在向量渲染清單層級 (OperatorList) 徹底過濾所有文字指令，
+ * 確保底圖 100% 只保留原始圖案、向量色塊、漸層與照片，完全不繪製任何文字字形，徹底根除底圖重疊陰影（Ghosting/Double Text）！
  */
-function eraseTextRegionsOnCanvas(ctx, segments, scale, canvasW, canvasH) {
-  if (!ctx || typeof ctx.getImageData !== "function" || !segments || segments.length === 0) return;
+async function renderPdfPageToCanvas(page, viewport, ctx, hideText) {
+  if (hideText) {
+    // 1. 攔截 Canvas 2D 上下文的文字方法
+    ctx.fillText = function () {};
+    ctx.strokeText = function () {};
 
-  for (const seg of segments) {
     try {
-      const padX = Math.max(2, Math.round(seg.fontSize * scale * 0.12));
-      const padY = Math.max(2, Math.round(seg.fontSize * scale * 0.15));
-      const x0 = Math.max(0, Math.floor(seg.xPt * scale) - padX);
-      const y0 = Math.max(0, Math.floor(seg.yTopPt * scale) - padY);
-      const x1 = Math.min(canvasW - 1, Math.ceil((seg.xPt + seg.widthPt) * scale) + padX);
-      const y1 = Math.min(canvasH - 1, Math.ceil((seg.yTopPt + seg.heightPt) * scale) + padY);
-      const w = x1 - x0 + 1;
-      const h = y1 - y0 + 1;
-      if (w <= 2 || h <= 2) continue;
+      // 2. 獲取底層向量操作指令清單 (OperatorList)
+      const opList = await page.getOperatorList();
+      if (opList && Array.isArray(opList.fnArray)) {
+        // 定義所有文字相關的 PDF.js OPS 代碼
+        const pdfOps = (window.pdfjsLib && window.pdfjsLib.OPS) || {};
+        const textOpCodes = new Set([
+          pdfOps.beginText || 31,
+          pdfOps.endText || 32,
+          pdfOps.setCharSpacing || 33,
+          pdfOps.setWordSpacing || 34,
+          pdfOps.setHScale || 35,
+          pdfOps.setLeading || 36,
+          pdfOps.setFont || 37,
+          pdfOps.setTextRenderingMode || 38,
+          pdfOps.setTextRise || 39,
+          pdfOps.moveText || 40,
+          pdfOps.setLeadingMoveText || 41,
+          pdfOps.setTextMatrix || 42,
+          pdfOps.nextLine || 43,
+          pdfOps.showText || 44,
+          pdfOps.showSpacedText || 45,
+          pdfOps.nextLineShowText || 46,
+          pdfOps.nextLineSetSpacingShowText || 47,
+          pdfOps.setCharWidth || 48,
+          pdfOps.setCharWidthAndBounds || 49,
+          31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49
+        ]);
 
-      const img = ctx.getImageData(x0, y0, w, h);
-      const data = img.data;
-
-      // For each vertical column x, linearly interpolate between top boundary pixel and bottom boundary pixel
-      for (let cx = 0; cx < w; cx++) {
-        const topIdx = cx * 4;
-        const botIdx = ((h - 1) * w + cx) * 4;
-        const rTop = data[topIdx];
-        const gTop = data[topIdx + 1];
-        const bTop = data[topIdx + 2];
-        const rBot = data[botIdx];
-        const gBot = data[botIdx + 1];
-        const bBot = data[botIdx + 2];
-
-        for (let cy = 1; cy < h - 1; cy++) {
-          const t = cy / (h - 1);
-          const idx = (cy * w + cx) * 4;
-          data[idx] = Math.round(rTop + (rBot - rTop) * t);
-          data[idx + 1] = Math.round(gTop + (gBot - gTop) * t);
-          data[idx + 2] = Math.round(bTop + (bBot - bTop) * t);
-          data[idx + 3] = 255;
+        // 直接在 operatorList 中過濾掉所有文字操作，保留所有圖片、向量形狀與漸層路徑
+        let writeIdx = 0;
+        for (let readIdx = 0; readIdx < opList.fnArray.length; readIdx++) {
+          const fn = opList.fnArray[readIdx];
+          if (textOpCodes.has(fn)) {
+            continue;
+          }
+          opList.fnArray[writeIdx] = fn;
+          opList.argsArray[writeIdx] = opList.argsArray[readIdx];
+          writeIdx++;
         }
+        opList.fnArray.length = writeIdx;
+        opList.argsArray.length = writeIdx;
       }
-
-      ctx.putImageData(img, x0, y0);
     } catch (_) {
-      // Ignore individual region errors
+      // 若獲取 operatorList 異常，繼續透過原型攔截防護
     }
   }
+
+  const renderTask = page.render({ canvasContext: ctx, viewport });
+
+  if (hideText && renderTask && renderTask._internalRenderTask) {
+    const irt = renderTask._internalRenderTask;
+    const patchGfx = (gfx) => {
+      if (!gfx) return;
+      gfx.showText = function () {};
+      gfx.showSpacedText = function () {};
+      gfx.showType3Text = function () {};
+      gfx.paintChar = function () {};
+      gfx.nextLineShowText = function () {};
+      gfx.nextLineSetSpacingShowText = function () {};
+    };
+    patchGfx(irt.gfx);
+    if (typeof irt.initializeGraphics === "function") {
+      const origInit = irt.initializeGraphics;
+      irt.initializeGraphics = function (...args) {
+        const res = origInit.apply(this, args);
+        patchGfx(this.gfx);
+        return res;
+      };
+    }
+  }
+
+  await renderTask.promise;
 }
 
 function renderPdf2PptPanel() {
@@ -1648,7 +1690,7 @@ function renderPdf2PptPanel() {
   // Update Mode Metric Display
   if (pptSettings.mode === "hybrid") {
     pptMetricMode.textContent = "原色圖案+文字框";
-    pptMetricHint.textContent = "維持 100% 圖案原色 + 原色可編輯文字框";
+    pptMetricHint.textContent = "維持 100% 圖案原色 + 透明底色文字框";
   } else if (pptSettings.mode === "editable") {
     pptMetricMode.textContent = "純文字方塊";
     pptMetricHint.textContent = "依原座標、字型與顏色建立文字框";
@@ -1668,7 +1710,7 @@ function renderPdf2PptPanel() {
       <div class="slides-empty-state">
         <div class="empty-icon">📊</div>
         <h3>將 PDF 拖放到左側，即可預覽投影片並匯出 .pptx</h3>
-        <p>支援保留原檔案名稱下載，亦可點擊右上角「載入測試範例」立即體驗 PDF 轉 PPT 效果</p>
+        <p>支援保留原檔案名稱下載，亦可點擊上方「載入測試範例」立即體驗 PDF 轉 PPT 效果</p>
       </div>
     `;
     return;
@@ -1759,7 +1801,7 @@ function renderPdf2PptPanel() {
       const modeBadgeText =
         pptSettings.mode === "image"
           ? `高畫質背景圖 + 備忘稿文字`
-          : `原色可編輯文字方塊 x ${blocks.length}`;
+          : `原色透明底色文字方塊 x ${blocks.length}`;
 
       return `
         <div class="slide-card">
@@ -1793,7 +1835,7 @@ function renderPdf2PptPanel() {
 }
 
 /**
- * 將指定 PDF 檔案依高解析度渲染並轉換為可編輯 .pptx 簡報下載（維持圖案原色、還原文字顏色與字型）
+ * 將指定 PDF 檔案依高解析度渲染並轉換為可編輯 .pptx 簡報下載（維持圖案原色、還原文字顏色與字型、文字方塊底色透明）
  */
 async function exportPdfToPptx(pdfFileObj) {
   if (!pdfFileObj || !pdfFileObj.parsedData) return;
@@ -1831,7 +1873,7 @@ async function exportPdfToPptx(pdfFileObj) {
       slideH = Number(Math.max(4, Math.min(14, 10 * ratio)).toFixed(3));
     }
 
-    // Render high-res page images (and cleanly inpaint/erase old raster text in hybrid mode without dimming graphics!)
+    // Render high-res page images if mode === 'image' or 'hybrid'
     const pageImages = [];
     if ((pptSettings.mode === "image" || pptSettings.mode === "hybrid") && pdfBytes && window.pdfjsLib) {
       const loadingTask = window.pdfjsLib.getDocument({
@@ -1851,14 +1893,12 @@ async function exportPdfToPptx(pdfFileObj) {
           const ctx = canvas.getContext("2d");
           ctx.fillStyle = "#ffffff";
           ctx.fillRect(0, 0, canvas.width, canvas.height);
-          await page.render({ canvasContext: ctx, viewport: vp }).promise;
-
-          // If in hybrid mode and optPptHideBgText ("智慧抹除底圖原文字") is checked:
-          // Erase ONLY the text glyph regions by vertical edge interpolation so 100% of graphics stay vivid!
-          if (pptSettings.mode === "hybrid" && pptSettings.hideBgText) {
-            const segs = pages[i - 1]?.pptSegments || pages[i - 1]?.lines || [];
-            eraseTextRegionsOnCanvas(ctx, segs, pptSettings.scale, canvas.width, canvas.height);
-          }
+          await renderPdfPageToCanvas(
+            page,
+            vp,
+            ctx,
+            pptSettings.mode === "hybrid" && Boolean(pptSettings.hideBgText)
+          );
 
           pageImages.push(canvas.toDataURL("image/png"));
         } else {
@@ -1892,7 +1932,7 @@ async function exportPdfToPptx(pdfFileObj) {
           });
         }
 
-        // 2. Add Editable Text Boxes with exact original color, font family, bold/italic, and 0 margin
+        // 2. Add Editable Text Boxes with transparent background, exact original color, font family, bold/italic, and 0 margin
         if (pptSettings.mode === "editable" || pptSettings.mode === "hybrid") {
           const ptScale = (slideW * 72) / pW;
           for (const b of blocks) {
@@ -1958,7 +1998,7 @@ async function exportPdfToPptx(pdfFileObj) {
 }
 
 /**
- * 原生 JSZip OpenXML (.pptx) 備援產生器（支援原始字型、文字顏色與無邊距文字方塊）
+ * 原生 JSZip OpenXML (.pptx) 備援產生器（支援原始字型、文字顏色與透明背景文字方塊）
  */
 async function buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pptSettings, pageImages) {
   const zip = new JSZip();
@@ -2067,6 +2107,7 @@ async function buildPptxArchiveWithJSZip(pages, bodyFontSize, slideW, slideH, pp
               <a:xfrm><a:off x="${xEmu}" y="${yEmu}"/><a:ext cx="${wEmu}" cy="${hEmu}"/></a:xfrm>
               <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
               <a:noFill/>
+              <a:ln><a:noFill/></a:ln>
             </p:spPr>
             <p:txBody>
               <a:bodyPr wrap="square" lIns="0" tIns="0" rIns="0" bIns="0" rtlCol="0"/>
